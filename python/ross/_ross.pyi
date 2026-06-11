@@ -74,6 +74,15 @@ class LP:
 
 
 class Simulator:
+    """A ROSS simulation.
+
+    **One-shot per process.** ROSS's C runtime (MPI_Init/MPI_Finalize, global
+    state in `g_tw_*`, the `tw_calloc` arena) is not re-entrant: you can only
+    successfully run one Simulator per Python interpreter. A second call to
+    `run()` raises RuntimeError. To run sweeps, spawn one subprocess per
+    parameter point (e.g. via `subprocess.run([sys.executable, ...])` under
+    mpirun); each fresh process gets a fresh ROSS runtime."""
+
     max_msg_size: int  # read-only after construction
     def __init__(
         self,
@@ -85,7 +94,12 @@ class Simulator:
         max_msg_size: int = 256,
         extra_args: Sequence[str] = (),
     ) -> None: ...
-    def run(self) -> None: ...
+    def run(self) -> None:
+        """Run the simulation to `end_time`. Blocks until done.
+
+        Calling `run()` more than once in the same process (on this Simulator
+        or any other) raises RuntimeError — see the class docstring."""
+        ...
 
 
 def register_lp_type(name: str, cls: type) -> None:

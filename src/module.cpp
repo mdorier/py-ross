@@ -548,7 +548,12 @@ NB_MODULE(_ross, m) {
           "Register a Python class to instantiate for LPs with this type name.");
 
     // ---- Simulator ------------------------------------------------------
-    nb::class_<Simulator>(m, "Simulator")
+    nb::class_<Simulator>(m, "Simulator",
+        "A ROSS simulation.\n\n"
+        "One-shot per process: ROSS's C runtime (MPI_Init/MPI_Finalize, the\n"
+        "g_tw_* globals, the tw_calloc arena) is not re-entrant. Only one\n"
+        "Simulator.run() can succeed per Python interpreter; a second call\n"
+        "raises RuntimeError. For sweeps, spawn one subprocess per run.")
         .def(nb::init<tw_lpid, nb::object, const std::string &, double,
                       unsigned int, std::size_t, std::vector<std::string>>(),
              "lps_per_rank"_a,
@@ -560,5 +565,7 @@ NB_MODULE(_ross, m) {
              "extra_args"_a = std::vector<std::string>{})
         .def_ro("max_msg_size", &Simulator::max_msg_size,
                 "The per-event payload-buffer ceiling (bytes) chosen at ctor time.")
-        .def("run", &Simulator::run);
+        .def("run", &Simulator::run,
+             "Run the simulation to end_time. Blocks until done.\n"
+             "Calling run() more than once per process raises RuntimeError.");
 }

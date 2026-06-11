@@ -1,3 +1,25 @@
+"""Python bindings for ROSS (Rensselaer's Optimistic Simulation System).
+
+Build a parallel discrete-event simulation in Python:
+
+    import ross
+
+    @ross.lp("tower")
+    class Tower(ross.LP):
+        def init(self): ...
+        def on_event(self, sender, msg, now): ...
+
+    sim = ross.Simulator(lps_per_rank=64, type_map=lambda gid: "tower",
+                         synch="conservative", end_time=1000.0)
+    sim.run()
+
+Launch under MPI with `mpirun -np N python my_sim.py`.
+
+**One simulation per process.** ROSS's C runtime is not re-entrant — only one
+`Simulator.run()` can succeed per Python interpreter. For parameter sweeps,
+spawn one subprocess per run (e.g. `subprocess.run([sys.executable, ...])`
+under mpirun)."""
+
 from __future__ import annotations
 
 import inspect
