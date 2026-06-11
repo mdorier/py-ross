@@ -2,8 +2,8 @@
 
 from typing import Any, Callable, Sequence
 
-PAYLOAD_BYTES: int
-"""Maximum size (in bytes) of a pickled payload that can ride inside one Msg."""
+DEFAULT_MAX_MSG_SIZE: int
+"""Default value of `Simulator.max_msg_size` when none is supplied (256)."""
 
 class Msg:
     """Event payload view. Use `.payload` to get the unpickled object (or
@@ -69,11 +69,12 @@ class LP:
         If `payload` is given (any pickleable object), it is pickled into the
         event buffer. The class of the payload must be importable on every
         rank for cross-rank sends. Raises `OverflowError` if the pickled
-        payload exceeds `ross.PAYLOAD_BYTES`."""
+        payload exceeds the active Simulator's `max_msg_size`."""
         ...
 
 
 class Simulator:
+    max_msg_size: int  # read-only after construction
     def __init__(
         self,
         lps_per_rank: int,
@@ -81,6 +82,7 @@ class Simulator:
         synch: str = "conservative",
         end_time: float = 100.0,
         nkp: int = 16,
+        max_msg_size: int = 256,
         extra_args: Sequence[str] = (),
     ) -> None: ...
     def run(self) -> None: ...

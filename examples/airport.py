@@ -103,6 +103,7 @@ def main() -> None:
         synch=args.synch,
         end_time=args.end,
         nkp=args.nkp,
+        max_msg_size=256,          # Arrive/Land pickle to ~30 B; 256 is ample
         extra_args=args.extra,
     )
     sim.run()

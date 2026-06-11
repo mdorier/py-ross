@@ -3,7 +3,9 @@ from __future__ import annotations
 import inspect
 from typing import Callable, TypeVar
 
-from ._ross import LP, Msg, BitField, Simulator, register_lp_type, PAYLOAD_BYTES
+from ._ross import (
+    LP, Msg, BitField, Simulator, register_lp_type, DEFAULT_MAX_MSG_SIZE,
+)
 
 # Internal alias kept for clarity in the decorator.
 _LP = LP
@@ -121,4 +123,4 @@ def lp(name: str) -> Callable[[T], T]:
 
 
 __all__ = ["LP", "Msg", "BitField", "Simulator", "register_lp_type", "lp",
-           "PAYLOAD_BYTES"]
+           "DEFAULT_MAX_MSG_SIZE"]

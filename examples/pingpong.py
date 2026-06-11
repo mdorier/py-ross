@@ -91,6 +91,7 @@ def main() -> None:
         type_map=lambda gid: "node",
         synch=args.synch,
         end_time=args.end,
+        max_msg_size=512,          # Ping(hops, trace) grows with hops; 512 covers target<=20
         extra_args=args.extra,
     )
     sim.run()

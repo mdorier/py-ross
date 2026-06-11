@@ -31,17 +31,37 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 // ---------------------------------------------------------------------------
-// Fixed-size message payload.
+// Message payload layout.
+//
+// The on-wire/in-pool object is a `MsgHeader` immediately followed by a byte
+// buffer sized at Simulator construction time. ROSS sees one fixed size
+// (header + g_max_msg_size) via tw_define_lps. We never declare the buffer
+// as part of the C++ struct — we address it as `reinterpret_cast<uint8_t*>(
+// hdr + 1)`, valid for [0, g_max_msg_size).
+//
+// The Python-visible `Msg` is a thin view {hdr*, cap} built by the trampolines
+// on the stack and passed to user handlers by reference.
 // ---------------------------------------------------------------------------
-static constexpr std::size_t PAYLOAD_BYTES = 4096;
+static constexpr std::size_t DEFAULT_MAX_MSG_SIZE = 256;
+
+struct MsgHeader {
+    uint64_t sender_gid;             // sender LP gid (delivered to handler as `sender`)
+    uint32_t payload_len;            // bytes of pickle stream after the header, or 0
+    uint32_t _pad;                   // keep buffer 8-byte aligned
+};
+static_assert(sizeof(MsgHeader) == 16, "MsgHeader must be 16 bytes");
 
 struct Msg {
-    uint64_t sender_gid;             // sender LP gid (delivered to handler as `sender`)
-    uint32_t payload_len;            // bytes of pickle stream in `payload[]`, or 0
-    uint32_t _pad;                   // keep payload[] 8-byte aligned
-    uint8_t  payload[PAYLOAD_BYTES]; // pickle bytes, valid for [0, payload_len)
+    MsgHeader  *hdr;
+    std::size_t cap;                 // == g_max_msg_size at construction time
+    uint8_t * buf()       { return reinterpret_cast<uint8_t *>(hdr + 1); }
+    const uint8_t * buf() const { return reinterpret_cast<const uint8_t *>(hdr + 1); }
 };
-static_assert(sizeof(Msg) == 16 + PAYLOAD_BYTES, "Msg layout drifted");
+
+// Active payload-buffer ceiling. Set at Simulator::run() before tw_define_lps
+// and read by trampolines / lp_send thereafter. v0 forbids re-entering
+// Simulator() in the same process, so there is no concurrency hazard.
+static std::size_t g_max_msg_size = 0;
 
 // ---------------------------------------------------------------------------
 // PyLPState lives in each ROSS LP's state vector. Holds a raw PyObject*.
@@ -183,9 +203,10 @@ static void c_event(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
-    Msg *m = static_cast<Msg *>(msg);
+    MsgHeader *h = static_cast<MsgHeader *>(msg);
+    Msg m{h, g_max_msg_size};
     double now = TW_STIME_DBL(tw_now(lp));
-    try { self->on_event(m->sender_gid, *m, now); }
+    try { self->on_event(h->sender_gid, m, now); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
         tw_error(TW_LOC, "ross: Python exception in on_event()");
@@ -197,9 +218,10 @@ static void c_revent(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
-    Msg *m = static_cast<Msg *>(msg);
+    MsgHeader *h = static_cast<MsgHeader *>(msg);
+    Msg m{h, g_max_msg_size};
     BitField bfw{bf};
-    try { self->reverse_event(m->sender_gid, *m, bfw); }
+    try { self->reverse_event(h->sender_gid, m, bfw); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
         tw_error(TW_LOC, "ross: Python exception in reverse_event()");
@@ -211,8 +233,9 @@ static void c_commit(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
-    Msg *m = static_cast<Msg *>(msg);
-    try { self->commit_event(m->sender_gid, *m); }
+    MsgHeader *h = static_cast<MsgHeader *>(msg);
+    Msg m{h, g_max_msg_size};
+    try { self->commit_event(h->sender_gid, m); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
     }
@@ -245,6 +268,7 @@ struct Simulator {
     double  end_time;
     int     synch;
     unsigned int nkp;
+    std::size_t max_msg_size;
     std::vector<std::string> extra_args;
     bool ran = false;
 
@@ -253,10 +277,12 @@ struct Simulator {
               const std::string &synch_str,
               double end_time_,
               unsigned int nkp_,
+              std::size_t max_msg_size_,
               std::vector<std::string> extra_args_)
         : lps_per_rank(lps_per_rank_),
           end_time(end_time_),
           nkp(nkp_),
+          max_msg_size(max_msg_size_),
           extra_args(std::move(extra_args_))
     {
         if      (synch_str == "sequential")     synch = 1;
@@ -264,6 +290,10 @@ struct Simulator {
         else if (synch_str == "optimistic")     synch = 3;
         else if (synch_str == "rollback_check") synch = 6;
         else throw std::runtime_error("synch must be sequential/conservative/optimistic/rollback_check");
+
+        if (max_msg_size == 0) {
+            throw std::runtime_error("ross.Simulator: max_msg_size must be > 0");
+        }
 
         Py_XDECREF(g_type_map);
         Py_INCREF(type_map.ptr());
@@ -291,10 +321,14 @@ struct Simulator {
         // need it inside c_event for any send/receive that carries a payload.
         ensure_pickle_loaded();
 
+        // Publish the buffer-ceiling globally so trampolines / lp_send can
+        // see it. Must happen before tw_define_lps allocates the event pool.
+        g_max_msg_size = max_msg_size;
+
         {
             nb::gil_scoped_release no_gil;
             tw_init(&argc, &argv);
-            tw_define_lps(lps_per_rank, sizeof(Msg));
+            tw_define_lps(lps_per_rank, sizeof(MsgHeader) + max_msg_size);
             for (tw_lpid i = 0; i < g_tw_nlp; ++i) {
                 tw_lp_settype(i, &g_one_lptype);
             }
@@ -367,21 +401,21 @@ static void lp_rev_rand_integer(LP &self) {
 // send(dest_gid, ts_offset, payload=None)
 // If payload is None, sends an empty event. Otherwise pickles `payload` and
 // copies it into the outgoing Msg. Raises OverflowError if the pickled
-// representation exceeds PAYLOAD_BYTES.
+// representation exceeds the active Simulator's max_msg_size.
 static void lp_send(LP &self, uint64_t dest_gid, double offset,
                     nb::object payload)
 {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
 
     tw_event *e = tw_event_new((tw_lpid) dest_gid, (tw_stime) offset, self.lp);
-    Msg *out = static_cast<Msg *>(tw_event_data(e));
+    MsgHeader *out = static_cast<MsgHeader *>(tw_event_data(e));
     out->sender_gid = self.lp->gid;
     out->_pad       = 0;
 
     if (payload.is_none()) {
         out->payload_len = 0;
-        // Leave payload[] uninitialised — receivers must not read it when
-        // payload_len == 0. (Avoids the ~4 KiB memset per empty event.)
+        // Leave the buffer uninitialised — receivers must not read it when
+        // payload_len == 0. (Avoids a per-empty-event memset.)
         tw_event_send(e);
         return;
     }
@@ -402,17 +436,17 @@ static void lp_send(LP &self, uint64_t dest_gid, double offset,
         throw nb::python_error();
     }
 
-    if ((std::size_t) n > PAYLOAD_BYTES) {
+    if ((std::size_t) n > g_max_msg_size) {
         Py_DECREF(res);
         std::string msg = "ross.LP.send: pickled payload of "
                         + std::to_string((long long) n)
-                        + " bytes exceeds PAYLOAD_BYTES ("
-                        + std::to_string(PAYLOAD_BYTES) + ") limit";
+                        + " bytes exceeds Simulator.max_msg_size ("
+                        + std::to_string(g_max_msg_size) + ") limit";
         PyErr_SetString(PyExc_OverflowError, msg.c_str());
         throw nb::python_error();
     }
 
-    std::memcpy(out->payload, buf, (std::size_t) n);
+    std::memcpy(reinterpret_cast<uint8_t *>(out + 1), buf, (std::size_t) n);
     out->payload_len = (uint32_t) n;
     Py_DECREF(res);
 
@@ -422,11 +456,11 @@ static void lp_send(LP &self, uint64_t dest_gid, double offset,
 // Msg.payload -> object | None
 // Lazily unpickles the buffer. Returns None for empty events.
 static nb::object msg_get_payload(Msg &self) {
-    if (self.payload_len == 0) return nb::none();
+    if (self.hdr->payload_len == 0) return nb::none();
     ensure_pickle_loaded();
     PyObject *buf = PyBytes_FromStringAndSize(
-        reinterpret_cast<const char *>(self.payload),
-        (Py_ssize_t) self.payload_len);
+        reinterpret_cast<const char *>(self.buf()),
+        (Py_ssize_t) self.hdr->payload_len);
     if (!buf) throw nb::python_error();
     PyObject *args = PyTuple_Pack(1, buf);
     Py_DECREF(buf);
@@ -460,7 +494,7 @@ NB_MODULE(_ross, m) {
     g_one_lptype.map        = (map_f)     c_map;
     g_one_lptype.state_sz   = sizeof(PyLPState);
 
-    m.attr("PAYLOAD_BYTES") = (int) PAYLOAD_BYTES;
+    m.attr("DEFAULT_MAX_MSG_SIZE") = (int) DEFAULT_MAX_MSG_SIZE;
 
     // ---- Msg ------------------------------------------------------------
     nb::class_<Msg>(m, "Msg",
@@ -506,7 +540,7 @@ NB_MODULE(_ross, m) {
              "If `payload` is given, it is pickled and must round-trip via pickle on\n"
              "the receiver. The class of the payload object must be importable on\n"
              "every rank for cross-rank sends. Raises OverflowError if the pickled\n"
-             "payload exceeds ross.PAYLOAD_BYTES.")
+             "payload exceeds the active Simulator's max_msg_size.")
         ;
 
     // ---- Registry -------------------------------------------------------
@@ -516,12 +550,15 @@ NB_MODULE(_ross, m) {
     // ---- Simulator ------------------------------------------------------
     nb::class_<Simulator>(m, "Simulator")
         .def(nb::init<tw_lpid, nb::object, const std::string &, double,
-                      unsigned int, std::vector<std::string>>(),
+                      unsigned int, std::size_t, std::vector<std::string>>(),
              "lps_per_rank"_a,
              "type_map"_a,
              "synch"_a = "conservative",
              "end_time"_a = 100.0,
              "nkp"_a = 16,
+             "max_msg_size"_a = DEFAULT_MAX_MSG_SIZE,
              "extra_args"_a = std::vector<std::string>{})
+        .def_ro("max_msg_size", &Simulator::max_msg_size,
+                "The per-event payload-buffer ceiling (bytes) chosen at ctor time.")
         .def("run", &Simulator::run);
 }

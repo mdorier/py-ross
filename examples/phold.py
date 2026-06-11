@@ -75,6 +75,7 @@ def main() -> None:
         synch=args.synch,
         end_time=args.end,
         nkp=args.nkp,
+        max_msg_size=64,           # PHOLD carries no payload; small buffer suffices
         extra_args=args.extra,
     )
     sim.run()
