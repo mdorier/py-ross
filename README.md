@@ -37,11 +37,10 @@ ROSS is fast and battle-tested but requires LPs to be written in C, with `tw_lpt
 
 Working: sequential / conservative / optimistic / rollback-check sync modes; single-rank and multi-rank MPI; pickled payloads with runtime-configurable buffer size; reverse handlers with per-event `BitField` for branch tracking; clean teardown (no nanobind leaks on optimistic-mode shutdown).
 
-Not yet implemented (named so we don't forget):
-- **Variable-size payloads / out-of-band transport.** `Simulator(max_msg_size=N)` is a hard cap; everything ships at that size. See [`docs/finding-msg-size.md`](#) (TODO) for the analysis.
+Not yet implemented yet:
+- **Variable-size payloads / out-of-band transport.** `Simulator(max_msg_size=N)` is a hard cap; everything ships at that size. This is because ROSS expects every message to be the same size.
 - **Multiple `Simulator()` instances per process.** ROSS's globals + `MPI_Init`/`MPI_Finalize` lifecycle make this unfeasible without upstream patches. Subprocess-per-run is the supported pattern.
 - **Custom LP mappings.** v0 uses LINEAR only (`rank r` owns gids `[r*lps_per_rank, (r+1)*lps_per_rank)`).
-- **Real-training FL clients.** `examples/fedasync.py` simulates compute/comm time only.
 
 ## Installation
 
