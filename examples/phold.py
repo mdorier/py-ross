@@ -8,26 +8,29 @@ delay plus lookahead.
 This mirrors ROSS/models/phold/phold.main.c closely.
 """
 
+from __future__ import annotations
+
 import argparse
+import os
+
 import ross
 
 # Globals shared across all LPs (set in main before run()).
-TOTAL_LPS = 0
-MEAN = 1.0
-LOOKAHEAD = 1.0
-PERCENT_REMOTE = 0.25
-START_EVENTS = 1
+TOTAL_LPS: int = 0
+MEAN: float = 1.0
+LOOKAHEAD: float = 1.0
+PERCENT_REMOTE: float = 0.25
+START_EVENTS: int = 1
 
 
+@ross.lp("phold")
 class PHOLD(ross.LP):
-    def init(self):
-        # Bootstrap: schedule `START_EVENTS` self-events.
+    def init(self) -> None:
         for _ in range(START_EVENTS):
             delay = self.rand_exponential(MEAN) + LOOKAHEAD
             self.send(self.gid, delay, msg_type=0)
 
-    def on_event(self, msg, now):
-        # Decide remote vs local.
+    def on_event(self, msg: ross.Msg, now: float) -> None:
         u = self.rand_uniform()
         if u <= PERCENT_REMOTE:
             dest = self.rand_integer(0, TOTAL_LPS - 1)
@@ -36,17 +39,13 @@ class PHOLD(ross.LP):
         delay = self.rand_exponential(MEAN) + LOOKAHEAD
         self.send(int(dest), delay, msg_type=0)
 
-    def reverse_event(self, msg, bf):
-        # Undo, in reverse order, the three RNG draws above.
+    def reverse_event(self, msg: ross.Msg, bf: ross.BitField) -> None:
         self.rev_rand_exponential()
-        self.rev_rand_integer()  # the rand_integer call (or unused branch)
+        self.rev_rand_integer()
         self.rev_rand_uniform()
 
-    def final(self):
-        pass
 
-
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--lps-per-rank", type=int, default=8)
     p.add_argument("--synch", default="sequential",
@@ -58,28 +57,18 @@ def main():
     p.add_argument("--remote", type=float, default=0.25)
     p.add_argument("--start-events", type=int, default=1)
     p.add_argument("--nkp", type=int, default=16)
-    p.add_argument("--extra", nargs="*", default=[],
-                   help="Extra args passed through to tw_init (e.g. --extramem=...)")
+    p.add_argument("--extra", nargs="*", default=[])
     args = p.parse_args()
 
     global TOTAL_LPS, MEAN, LOOKAHEAD, PERCENT_REMOTE, START_EVENTS
-    MEAN = args.mean - args.lookahead  # match phold.main.c semantics
+    MEAN = args.mean - args.lookahead
     LOOKAHEAD = args.lookahead
     PERCENT_REMOTE = args.remote
     START_EVENTS = args.start_events
 
-    # We don't know nranks yet, but tw_init populates it before c_init runs.
-    # We need TOTAL_LPS for rand_integer(0, total-1). Use a sentinel and
-    # patch it on the first event — or simpler: compute it from extras.
-    # The simplest fix: pass lps-per-rank * mpirun_np through env or
-    # accept that single-rank means TOTAL_LPS == lps_per_rank.
-    # For v0 we set TOTAL_LPS = lps_per_rank * 1 and override via --extra
-    # if running multi-rank. mpirun-aware sizing:
-    import os
-    np_env = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
-                  os.environ.get("PMI_SIZE",
-                  os.environ.get("MPI_LOCALNRANKS", "1"))))
-    TOTAL_LPS = args.lps_per_rank * np_env
+    nranks = int(os.environ.get("OMPI_COMM_WORLD_SIZE",
+                  os.environ.get("PMI_SIZE", "1")))
+    TOTAL_LPS = args.lps_per_rank * nranks
 
     sim = ross.Simulator(
         lps_per_rank=args.lps_per_rank,
@@ -89,7 +78,6 @@ def main():
         nkp=args.nkp,
         extra_args=args.extra,
     )
-    ross.register_lp_type("phold", PHOLD)
     sim.run()
 
 
