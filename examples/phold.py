@@ -29,18 +29,22 @@ class PHOLD(ross.LP):
             delay = self.rand_exponential(MEAN) + LOOKAHEAD
             self.send(self.gid, delay)
 
-    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float, bf: ross.BitField) -> None:
         u = self.rand_uniform()
         if u <= PERCENT_REMOTE:
+            bf.c0 = True                 # remember we took the remote branch
             dest = self.rand_integer(0, TOTAL_LPS - 1)
         else:
+            bf.c0 = False
             dest = self.gid
         delay = self.rand_exponential(MEAN) + LOOKAHEAD
         self.send(int(dest), delay)
 
     def reverse_event(self, sender: int, msg: ross.Msg, bf: ross.BitField) -> None:
+        # Undo in reverse order of the forward draws.
         self.rev_rand_exponential()
-        self.rev_rand_integer()
+        if bf.c0:                        # only undo the integer draw if we took it
+            self.rev_rand_integer()
         self.rev_rand_uniform()
 
 

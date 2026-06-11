@@ -53,7 +53,7 @@ class Tower(ross.LP):
         self.landed = 0
         self.dispatched = 0
 
-    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float, bf: ross.BitField) -> None:
         p = msg.payload
         if isinstance(p, Arrive):
             self.in_air += 1

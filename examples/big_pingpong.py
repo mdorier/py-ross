@@ -24,7 +24,7 @@ class Big(ross.LP):
         if self.gid == 0:
             self.send(1, 1.0, payload=b"\x42" * BYTES)
 
-    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float, bf: ross.BitField) -> None:
         data = msg.payload
         assert isinstance(data, (bytes, bytearray)), f"unexpected payload {type(data)}"
         assert len(data) == BYTES, f"size mismatch: got {len(data)}, want {BYTES}"

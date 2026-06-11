@@ -128,11 +128,11 @@ struct LP {
 
     virtual void init()                                                        {}
     virtual void pre_run()                                                     {}
-    virtual void on_event(uint64_t /*sender*/, Msg & /*m*/, double /*now*/)    {}
+    virtual void on_event(uint64_t /*sender*/, Msg & /*m*/, double /*now*/, BitField & /*bf*/) {}
     virtual void reverse_event(uint64_t /*sender*/, Msg & /*m*/, BitField & /*bf*/) {
         tw_error(TW_LOC, "reverse_event called on an LP that did not override it (optimistic mode requires it)");
     }
-    virtual void commit_event(uint64_t /*sender*/, Msg & /*m*/)                {}
+    virtual void commit_event(uint64_t /*sender*/, Msg & /*m*/, BitField & /*bf*/) {}
     virtual void final_()                                                      {}
 };
 
@@ -140,9 +140,9 @@ struct LP_Tramp : LP {
     NB_TRAMPOLINE(LP, 6);
     void init()                                                  override { NB_OVERRIDE(init); }
     void pre_run()                                               override { NB_OVERRIDE(pre_run); }
-    void on_event(uint64_t sender, Msg &m, double now)           override { NB_OVERRIDE(on_event, sender, m, now); }
+    void on_event(uint64_t sender, Msg &m, double now, BitField &bf) override { NB_OVERRIDE(on_event, sender, m, now, bf); }
     void reverse_event(uint64_t sender, Msg &m, BitField &bf)    override { NB_OVERRIDE(reverse_event, sender, m, bf); }
-    void commit_event(uint64_t sender, Msg &m)                   override { NB_OVERRIDE(commit_event, sender, m); }
+    void commit_event(uint64_t sender, Msg &m, BitField &bf)     override { NB_OVERRIDE(commit_event, sender, m, bf); }
     void final_()                                                override { NB_OVERRIDE_NAME("final", final_); }
 };
 
@@ -199,14 +199,14 @@ static void c_pre_run(void *sv, tw_lp *lp) {
 }
 
 static void c_event(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
-    (void) bf;
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
     MsgHeader *h = static_cast<MsgHeader *>(msg);
     Msg m{h, g_max_msg_size};
+    BitField bfw{bf};
     double now = TW_STIME_DBL(tw_now(lp));
-    try { self->on_event(h->sender_gid, m, now); }
+    try { self->on_event(h->sender_gid, m, now, bfw); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
         tw_error(TW_LOC, "ross: Python exception in on_event()");
@@ -229,13 +229,14 @@ static void c_revent(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
 }
 
 static void c_commit(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
-    (void) bf; (void) lp;
+    (void) lp;
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
     MsgHeader *h = static_cast<MsgHeader *>(msg);
     Msg m{h, g_max_msg_size};
-    try { self->commit_event(h->sender_gid, m); }
+    BitField bfw{bf};
+    try { self->commit_event(h->sender_gid, m, bfw); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
     }

@@ -28,7 +28,7 @@ class BigSender(ross.LP):
         print("FAIL: no exception raised", flush=True)
         sys.exit(1)
 
-    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float, bf: ross.BitField) -> None:
         pass
 
 

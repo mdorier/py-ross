@@ -39,7 +39,7 @@ class Node(ross.LP):
             # Kick things off.
             self.send(1, 1.0, payload=Ping(hops=0, trace=[0]))
 
-    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float, bf: ross.BitField) -> None:
         self.seen_senders.add(sender)
         p = msg.payload
         assert isinstance(p, Ping), f"unexpected payload {type(p)}"
