@@ -1,8 +1,15 @@
-// py-ross: Python binding for ROSS (v0)
+// py-ross: Python binding for ROSS.
 //
-// Exposes a small surface: ross.LP, ross.Msg, ross.BitField, ross.Simulator,
-// ross.register_lp_type. Each ROSS LP holds a PyObject* to a user Python
-// instance; C trampolines acquire the GIL and dispatch to overridden methods.
+// Exposes ross.LP, ross.Msg, ross.BitField, ross.Simulator,
+// ross.register_lp_type, ross.PAYLOAD_BYTES. Each ROSS LP holds a PyObject*
+// to a user Python instance; C trampolines acquire the GIL and dispatch to
+// overridden methods.
+//
+// Message payload: a fixed POD with an 8-byte runtime header
+// {sender_gid, payload_len} followed by a 4 KiB pickle buffer. The Python
+// `Msg` exposes only `payload`, a lazily-unpickled object (or None). The
+// sender's gid is delivered to handlers as a positional `sender: int` arg
+// rather than as a field on `Msg`.
 
 #include <nanobind/nanobind.h>
 #include <nanobind/trampoline.h>
@@ -24,20 +31,20 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 // ---------------------------------------------------------------------------
-// Fixed-size message payload (v0: 256 bytes).
+// Fixed-size message payload.
 // ---------------------------------------------------------------------------
+static constexpr std::size_t PAYLOAD_BYTES = 4096;
+
 struct Msg {
-    uint32_t msg_type;
-    uint32_t _pad;
-    uint64_t sender_gid;
-    uint8_t  scratch[240];
+    uint64_t sender_gid;             // sender LP gid (delivered to handler as `sender`)
+    uint32_t payload_len;            // bytes of pickle stream in `payload[]`, or 0
+    uint32_t _pad;                   // keep payload[] 8-byte aligned
+    uint8_t  payload[PAYLOAD_BYTES]; // pickle bytes, valid for [0, payload_len)
 };
-static_assert(sizeof(Msg) == 256, "Msg must be 256 bytes");
+static_assert(sizeof(Msg) == 16 + PAYLOAD_BYTES, "Msg layout drifted");
 
 // ---------------------------------------------------------------------------
 // PyLPState lives in each ROSS LP's state vector. Holds a raw PyObject*.
-// We do NOT own the GIL when this struct is touched from C; users of
-// ->instance must acquire it first.
 // ---------------------------------------------------------------------------
 struct PyLPState {
     PyObject *instance;   // strong ref; released in c_final
@@ -45,81 +52,88 @@ struct PyLPState {
 };
 
 // ---------------------------------------------------------------------------
-// Forward decl for the LP Python base type and BitField view.
+// Forward decls.
 // ---------------------------------------------------------------------------
 struct LP;
 struct BitField { tw_bf *bf; };
 
 // ---------------------------------------------------------------------------
-// Global registry: type-name -> Python class object.
-// Populated from Python via register_lp_type("name", Class).
-// Read from c_init via the type_map callback (set on Simulator).
+// Globals owned via raw PyObject* (so we don't destruct nb::object at process
+// exit, after the interpreter has finalized).
 // ---------------------------------------------------------------------------
-// Owned strong refs (raw PyObject* so we don't destruct nb::object at process exit).
 static std::unordered_map<std::string, PyObject *> g_lp_classes;
-static PyObject *g_type_map = nullptr;
+static PyObject *g_type_map     = nullptr;
+static PyObject *g_pickle_dumps = nullptr;  // pickle.dumps
+static PyObject *g_pickle_loads = nullptr;  // pickle.loads
+static PyObject *g_pickle_protocol = nullptr;  // int: HIGHEST_PROTOCOL
 
-// Called with GIL held. Drops all strong refs we own.
+// Called with GIL held.
 static void clear_python_refs() {
     for (auto &kv : g_lp_classes) Py_XDECREF(kv.second);
     g_lp_classes.clear();
-    Py_XDECREF(g_type_map);
-    g_type_map = nullptr;
+    Py_XDECREF(g_type_map);       g_type_map = nullptr;
+    Py_XDECREF(g_pickle_dumps);   g_pickle_dumps = nullptr;
+    Py_XDECREF(g_pickle_loads);   g_pickle_loads = nullptr;
+    Py_XDECREF(g_pickle_protocol); g_pickle_protocol = nullptr;
 }
 
-// Optional: track whether we expect optimistic / reverse handlers
+// Called with GIL held. Idempotent.
+static void ensure_pickle_loaded() {
+    if (g_pickle_dumps && g_pickle_loads && g_pickle_protocol) return;
+    PyObject *mod = PyImport_ImportModule("pickle");
+    if (!mod) throw nb::python_error();
+    g_pickle_dumps = PyObject_GetAttrString(mod, "dumps");
+    g_pickle_loads = PyObject_GetAttrString(mod, "loads");
+    g_pickle_protocol = PyObject_GetAttrString(mod, "HIGHEST_PROTOCOL");
+    Py_DECREF(mod);
+    if (!g_pickle_dumps || !g_pickle_loads || !g_pickle_protocol) {
+        throw nb::python_error();
+    }
+}
+
 static bool g_optimistic_required = false;
 
-// Single tw_lptype shared by every LP. All LPs route through the same
-// trampolines; the per-LP behavior comes from the Python instance.
+// Single tw_lptype shared by every LP. All LPs route through these trampolines;
+// per-LP behavior comes from the Python instance.
 static tw_lptype g_one_lptype;
 
-// The lone "type 0" used in the typemap callback.
-static tw_lpid one_typemap(tw_lpid /*gid*/) { return 0; }
-
 // ---------------------------------------------------------------------------
-// LP base class. Stores a back-pointer to its tw_lp so it can call
-// ROSS APIs (send, rng, now, gid).
+// LP base class.
 // ---------------------------------------------------------------------------
 struct LP {
-    tw_lp *lp = nullptr;  // set in c_init
+    tw_lp *lp = nullptr;
 
     LP() = default;
     virtual ~LP() = default;
 
-    // Hooks (default no-ops). nanobind trampoline forwards these to Python.
-    virtual void init()                                       {}
-    virtual void pre_run()                                    {}
-    virtual void on_event(Msg & /*m*/, double /*now*/)        {}
-    virtual void reverse_event(Msg & /*m*/, BitField & /*bf*/) {
+    virtual void init()                                                        {}
+    virtual void pre_run()                                                     {}
+    virtual void on_event(uint64_t /*sender*/, Msg & /*m*/, double /*now*/)    {}
+    virtual void reverse_event(uint64_t /*sender*/, Msg & /*m*/, BitField & /*bf*/) {
         tw_error(TW_LOC, "reverse_event called on an LP that did not override it (optimistic mode requires it)");
     }
-    virtual void commit_event(Msg & /*m*/)                    {}
-    virtual void final_()                                     {}
+    virtual void commit_event(uint64_t /*sender*/, Msg & /*m*/)                {}
+    virtual void final_()                                                      {}
 };
 
-// nanobind trampoline so Python subclasses can override the virtuals.
 struct LP_Tramp : LP {
     NB_TRAMPOLINE(LP, 6);
-    void init()                              override { NB_OVERRIDE(init); }
-    void pre_run()                           override { NB_OVERRIDE(pre_run); }
-    void on_event(Msg &m, double now)        override { NB_OVERRIDE(on_event, m, now); }
-    void reverse_event(Msg &m, BitField &bf) override { NB_OVERRIDE(reverse_event, m, bf); }
-    void commit_event(Msg &m)                override { NB_OVERRIDE(commit_event, m); }
-    void final_()                            override { NB_OVERRIDE_NAME("final", final_); }
+    void init()                                                  override { NB_OVERRIDE(init); }
+    void pre_run()                                               override { NB_OVERRIDE(pre_run); }
+    void on_event(uint64_t sender, Msg &m, double now)           override { NB_OVERRIDE(on_event, sender, m, now); }
+    void reverse_event(uint64_t sender, Msg &m, BitField &bf)    override { NB_OVERRIDE(reverse_event, sender, m, bf); }
+    void commit_event(uint64_t sender, Msg &m)                   override { NB_OVERRIDE(commit_event, sender, m); }
+    void final_()                                                override { NB_OVERRIDE_NAME("final", final_); }
 };
 
-// Helper: pull the LP* out of a PyLPState-backed sv.
 static inline LP * get_lp_from_sv(void *sv) {
     PyLPState *st = static_cast<PyLPState *>(sv);
     if (!st->instance) return nullptr;
-    // Borrowed reference, no GIL change here -- caller already holds GIL.
-    LP *self = nb::inst_ptr<LP>(nb::handle(st->instance));
-    return self;
+    return nb::inst_ptr<LP>(nb::handle(st->instance));
 }
 
 // ---------------------------------------------------------------------------
-// Trampolines: ROSS-callable C functions that bounce into Python.
+// Trampolines.
 // ---------------------------------------------------------------------------
 static void c_init(void *sv, tw_lp *lp) {
     PyLPState *st = static_cast<PyLPState *>(sv);
@@ -128,7 +142,6 @@ static void c_init(void *sv, tw_lp *lp) {
 
     nb::gil_scoped_acquire gil;
     try {
-        // Decide which class to instantiate
         if (!g_type_map) {
             tw_error(TW_LOC, "ross.Simulator: type_map not set");
         }
@@ -139,15 +152,11 @@ static void c_init(void *sv, tw_lp *lp) {
             tw_error(TW_LOC, "ross: unregistered LP type '%s' for gid %llu",
                      name.c_str(), (unsigned long long) lp->gid);
         }
-        // Instantiate the Python class (no args).
         nb::object py_inst = nb::borrow(it->second)();
-        // Stash a strong ref. We INCREF here; c_final releases.
         Py_INCREF(py_inst.ptr());
         st->instance = py_inst.ptr();
-        // Wire back-pointer.
         LP *self = nb::inst_ptr<LP>(py_inst);
         self->lp = lp;
-        // Call user's init().
         self->init();
     } catch (nb::python_error &e) {
         e.restore();
@@ -170,13 +179,13 @@ static void c_pre_run(void *sv, tw_lp *lp) {
 }
 
 static void c_event(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
-    (void) bf; (void) lp;
+    (void) bf;
     nb::gil_scoped_acquire gil;
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
     Msg *m = static_cast<Msg *>(msg);
     double now = TW_STIME_DBL(tw_now(lp));
-    try { self->on_event(*m, now); }
+    try { self->on_event(m->sender_gid, *m, now); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
         tw_error(TW_LOC, "ross: Python exception in on_event()");
@@ -190,7 +199,7 @@ static void c_revent(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
     if (!self) return;
     Msg *m = static_cast<Msg *>(msg);
     BitField bfw{bf};
-    try { self->reverse_event(*m, bfw); }
+    try { self->reverse_event(m->sender_gid, *m, bfw); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
         tw_error(TW_LOC, "ross: Python exception in reverse_event()");
@@ -203,10 +212,9 @@ static void c_commit(void *sv, tw_bf *bf, void *msg, tw_lp *lp) {
     LP *self = get_lp_from_sv(sv);
     if (!self) return;
     Msg *m = static_cast<Msg *>(msg);
-    try { self->commit_event(*m); }
+    try { self->commit_event(m->sender_gid, *m); }
     catch (nb::python_error &e) {
         e.restore(); PyErr_Print();
-        // Commit is best-effort; don't abort the simulation.
     }
 }
 
@@ -226,17 +234,16 @@ static void c_final(void *sv, tw_lp *lp) {
 }
 
 static tw_peid c_map(tw_lpid gid) {
-    // LINEAR mapping: gids [r*nlp, (r+1)*nlp) live on rank r.
     return (tw_peid)(gid / g_tw_nlp);
 }
 
 // ---------------------------------------------------------------------------
-// Simulator: wraps tw_init/tw_define_lps/tw_run/tw_end.
+// Simulator.
 // ---------------------------------------------------------------------------
 struct Simulator {
     tw_lpid lps_per_rank;
     double  end_time;
-    int     synch;       // 1=seq, 2=cons, 3=opt, 6=rollback-check
+    int     synch;
     unsigned int nkp;
     std::vector<std::string> extra_args;
     bool ran = false;
@@ -265,10 +272,9 @@ struct Simulator {
     }
 
     void run() {
-        if (ran) throw std::runtime_error("Simulator.run() may only be called once per process (v0)");
+        if (ran) throw std::runtime_error("Simulator.run() may only be called once per process");
         ran = true;
 
-        // Synthesize argv: progname, --synch=, --end=, --nkp=, extras...
         std::vector<std::string> argv_storage;
         argv_storage.emplace_back("py-ross");
         argv_storage.emplace_back("--synch=" + std::to_string(synch));
@@ -281,7 +287,10 @@ struct Simulator {
         int argc = (int) argv_ptrs.size();
         char **argv = argv_ptrs.data();
 
-        // ROSS init
+        // Make sure pickle is importable before we release the GIL; we'll
+        // need it inside c_event for any send/receive that carries a payload.
+        ensure_pickle_loaded();
+
         {
             nb::gil_scoped_release no_gil;
             tw_init(&argc, &argv);
@@ -293,12 +302,6 @@ struct Simulator {
             tw_end();
         }
 
-        // Drop all Python refs we own. Important: this must happen while
-        // the interpreter is still alive (i.e. before module shutdown), or
-        // the static destructors will touch freed Python state and crash.
-        // tw_end() has already invoked our c_final on every LP, so the
-        // per-LP PyObject* refs are gone; we just need to release the
-        // registry and the type_map callable.
         {
             nb::gil_scoped_acquire gil;
             clear_python_refs();
@@ -306,8 +309,6 @@ struct Simulator {
     }
 
     ~Simulator() {
-        // Belt-and-braces: if the user never called run() (e.g. an exception
-        // between ctor and run), still release the type_map ref.
         if (Py_IsInitialized()) {
             nb::gil_scoped_acquire gil;
             clear_python_refs();
@@ -316,7 +317,7 @@ struct Simulator {
 };
 
 // ---------------------------------------------------------------------------
-// register_lp_type (Python side). Caller has the GIL.
+// register_lp_type.
 // ---------------------------------------------------------------------------
 static void register_lp_type(const std::string &name, nb::object cls) {
     auto it = g_lp_classes.find(name);
@@ -326,7 +327,7 @@ static void register_lp_type(const std::string &name, nb::object cls) {
 }
 
 // ---------------------------------------------------------------------------
-// LP method shims (called from Python; we have the GIL).
+// LP method shims.
 // ---------------------------------------------------------------------------
 static uint64_t lp_get_gid(LP &self) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
@@ -342,54 +343,102 @@ static double lp_rand_uniform(LP &self) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     return tw_rand_unif(self.lp->rng);
 }
-
 static double lp_rand_exponential(LP &self, double mean) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     return tw_rand_exponential(self.lp->rng, mean);
 }
-
 static long lp_rand_integer(LP &self, long lo, long hi) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     return tw_rand_integer(self.lp->rng, lo, hi);
 }
-
 static void lp_rev_rand_uniform(LP &self) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     tw_rand_reverse_unif(self.lp->rng);
 }
-
 static void lp_rev_rand_exponential(LP &self) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     tw_rand_reverse_unif(self.lp->rng);
 }
-
 static void lp_rev_rand_integer(LP &self) {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
     tw_rand_reverse_unif(self.lp->rng);
 }
 
-// send(dest, ts_offset, msg_type, scratch=b"")
+// send(dest_gid, ts_offset, payload=None)
+// If payload is None, sends an empty event. Otherwise pickles `payload` and
+// copies it into the outgoing Msg. Raises OverflowError if the pickled
+// representation exceeds PAYLOAD_BYTES.
 static void lp_send(LP &self, uint64_t dest_gid, double offset,
-                    uint32_t msg_type, nb::bytes scratch)
+                    nb::object payload)
 {
     if (!self.lp) throw std::runtime_error("LP not attached yet");
+
     tw_event *e = tw_event_new((tw_lpid) dest_gid, (tw_stime) offset, self.lp);
     Msg *out = static_cast<Msg *>(tw_event_data(e));
-    out->msg_type   = msg_type;
-    out->_pad       = 0;
     out->sender_gid = self.lp->gid;
-    std::memset(out->scratch, 0, sizeof(out->scratch));
-    Py_ssize_t n = (Py_ssize_t) scratch.size();
-    if (n > (Py_ssize_t) sizeof(out->scratch)) {
-        throw std::runtime_error("ross.LP.send: scratch larger than 240 bytes");
+    out->_pad       = 0;
+
+    if (payload.is_none()) {
+        out->payload_len = 0;
+        // Leave payload[] uninitialised — receivers must not read it when
+        // payload_len == 0. (Avoids the ~4 KiB memset per empty event.)
+        tw_event_send(e);
+        return;
     }
-    if (n > 0) std::memcpy(out->scratch, scratch.c_str(), (size_t) n);
+
+    ensure_pickle_loaded();
+
+    // pickle.dumps(payload, HIGHEST_PROTOCOL)
+    PyObject *args = PyTuple_Pack(2, payload.ptr(), g_pickle_protocol);
+    if (!args) throw nb::python_error();
+    PyObject *res = PyObject_Call(g_pickle_dumps, args, nullptr);
+    Py_DECREF(args);
+    if (!res) throw nb::python_error();
+
+    char *buf = nullptr;
+    Py_ssize_t n = 0;
+    if (PyBytes_AsStringAndSize(res, &buf, &n) != 0) {
+        Py_DECREF(res);
+        throw nb::python_error();
+    }
+
+    if ((std::size_t) n > PAYLOAD_BYTES) {
+        Py_DECREF(res);
+        std::string msg = "ross.LP.send: pickled payload of "
+                        + std::to_string((long long) n)
+                        + " bytes exceeds PAYLOAD_BYTES ("
+                        + std::to_string(PAYLOAD_BYTES) + ") limit";
+        PyErr_SetString(PyExc_OverflowError, msg.c_str());
+        throw nb::python_error();
+    }
+
+    std::memcpy(out->payload, buf, (std::size_t) n);
+    out->payload_len = (uint32_t) n;
+    Py_DECREF(res);
+
     tw_event_send(e);
 }
 
+// Msg.payload -> object | None
+// Lazily unpickles the buffer. Returns None for empty events.
+static nb::object msg_get_payload(Msg &self) {
+    if (self.payload_len == 0) return nb::none();
+    ensure_pickle_loaded();
+    PyObject *buf = PyBytes_FromStringAndSize(
+        reinterpret_cast<const char *>(self.payload),
+        (Py_ssize_t) self.payload_len);
+    if (!buf) throw nb::python_error();
+    PyObject *args = PyTuple_Pack(1, buf);
+    Py_DECREF(buf);
+    if (!args) throw nb::python_error();
+    PyObject *res = PyObject_Call(g_pickle_loads, args, nullptr);
+    Py_DECREF(args);
+    if (!res) throw nb::python_error();
+    return nb::steal(res);
+}
+
 // ---------------------------------------------------------------------------
-// BitField: thin view onto tw_bf*. Lets the Python user read/write
-// bf.c0 .. bf.c31 in optimistic mode. (Struct declared above.)
+// BitField property macro.
 // ---------------------------------------------------------------------------
 #define BF_PROP(N) \
     .def_prop_rw("c" #N, \
@@ -402,7 +451,6 @@ static void lp_send(LP &self, uint64_t dest_gid, double offset,
 NB_MODULE(_ross, m) {
     m.doc() = "Python bindings for ROSS (Rensselaer's Optimistic Simulation System)";
 
-    // Install our single shared tw_lptype with all the trampolines.
     g_one_lptype.init       = (init_f)    c_init;
     g_one_lptype.pre_run    = (pre_run_f) c_pre_run;
     g_one_lptype.event      = (event_f)   c_event;
@@ -412,16 +460,16 @@ NB_MODULE(_ross, m) {
     g_one_lptype.map        = (map_f)     c_map;
     g_one_lptype.state_sz   = sizeof(PyLPState);
 
-    // ---- Msg (a view onto the C payload) --------------------------------
-    nb::class_<Msg>(m, "Msg")
-        .def_rw("msg_type", &Msg::msg_type)
-        .def_rw("sender_gid", &Msg::sender_gid)
-        .def_prop_ro("scratch",
-            [](Msg &self) {
-                return nb::bytes(reinterpret_cast<const char *>(self.scratch),
-                                 sizeof(self.scratch));
-            },
-            "Read-only copy of the 240-byte scratch buffer.");
+    m.attr("PAYLOAD_BYTES") = (int) PAYLOAD_BYTES;
+
+    // ---- Msg ------------------------------------------------------------
+    nb::class_<Msg>(m, "Msg",
+        "Event payload view. Use `msg.payload` to get the unpickled object\n"
+        "(or None for an empty event). The sender's LP gid is delivered as a\n"
+        "separate `sender` argument to event handlers, not as a Msg field.")
+        .def_prop_ro("payload", &msg_get_payload,
+            "The unpickled Python object the sender attached, or None if the\n"
+            "event was sent with payload=None (an empty event).");
 
     // ---- BitField -------------------------------------------------------
     nb::class_<BitField>(m, "BitField")
@@ -453,8 +501,12 @@ NB_MODULE(_ross, m) {
         .def("rev_rand_exponential",&lp_rev_rand_exponential)
         .def("rev_rand_integer",    &lp_rev_rand_integer)
         .def("send",                &lp_send,
-             "dest_gid"_a, "ts_offset"_a, "msg_type"_a,
-             "scratch"_a = nb::bytes(""))
+             "dest_gid"_a, "ts_offset"_a, "payload"_a = nb::none(),
+             "Schedule an event at dest_gid `ts_offset` virtual-time units ahead.\n"
+             "If `payload` is given, it is pickled and must round-trip via pickle on\n"
+             "the receiver. The class of the payload object must be importable on\n"
+             "every rank for cross-rank sends. Raises OverflowError if the pickled\n"
+             "payload exceeds ross.PAYLOAD_BYTES.")
         ;
 
     // ---- Registry -------------------------------------------------------

@@ -5,7 +5,7 @@ forwards a new event either to a random remote LP (with probability
 `percent_remote`) or back to itself, with an exponentially-distributed
 delay plus lookahead.
 
-This mirrors ROSS/models/phold/phold.main.c closely.
+Events carry no payload — the arrival itself is the signal.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import os
 
 import ross
 
-# Globals shared across all LPs (set in main before run()).
 TOTAL_LPS: int = 0
 MEAN: float = 1.0
 LOOKAHEAD: float = 1.0
@@ -28,18 +27,18 @@ class PHOLD(ross.LP):
     def init(self) -> None:
         for _ in range(START_EVENTS):
             delay = self.rand_exponential(MEAN) + LOOKAHEAD
-            self.send(self.gid, delay, msg_type=0)
+            self.send(self.gid, delay)
 
-    def on_event(self, msg: ross.Msg, now: float) -> None:
+    def on_event(self, sender: int, msg: ross.Msg, now: float) -> None:
         u = self.rand_uniform()
         if u <= PERCENT_REMOTE:
             dest = self.rand_integer(0, TOTAL_LPS - 1)
         else:
             dest = self.gid
         delay = self.rand_exponential(MEAN) + LOOKAHEAD
-        self.send(int(dest), delay, msg_type=0)
+        self.send(int(dest), delay)
 
-    def reverse_event(self, msg: ross.Msg, bf: ross.BitField) -> None:
+    def reverse_event(self, sender: int, msg: ross.Msg, bf: ross.BitField) -> None:
         self.rev_rand_exponential()
         self.rev_rand_integer()
         self.rev_rand_uniform()

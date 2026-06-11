@@ -1,14 +1,18 @@
 """Type stubs for the compiled `ross._ross` extension."""
 
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
+
+PAYLOAD_BYTES: int
+"""Maximum size (in bytes) of a pickled payload that can ride inside one Msg."""
 
 class Msg:
-    """View onto the 256-byte event payload carried by ROSS."""
-    msg_type: int            # uint32
-    sender_gid: int          # uint64
+    """Event payload view. Use `.payload` to get the unpickled object (or
+    `None` for an empty event). The sender's LP gid is delivered as a separate
+    `sender` argument to event handlers, not as a field on Msg."""
     @property
-    def scratch(self) -> bytes:
-        """Read-only copy of the 240-byte user scratch buffer."""
+    def payload(self) -> Any:
+        """The unpickled Python object the sender attached, or None if the
+        event was sent with payload=None."""
         ...
 
 class BitField:
@@ -31,9 +35,9 @@ class LP:
     # Lifecycle hooks — override on subclasses.
     def init(self) -> None: ...
     def pre_run(self) -> None: ...
-    def on_event(self, msg: Msg, now: float) -> None: ...
-    def reverse_event(self, msg: Msg, bf: BitField) -> None: ...
-    def commit_event(self, msg: Msg) -> None: ...
+    def on_event(self, sender: int, msg: Msg, now: float) -> None: ...
+    def reverse_event(self, sender: int, msg: Msg, bf: BitField) -> None: ...
+    def commit_event(self, sender: int, msg: Msg) -> None: ...
     def final(self) -> None: ...
 
     # Runtime-provided attributes / methods.
@@ -58,10 +62,14 @@ class LP:
         self,
         dest_gid: int,
         ts_offset: float,
-        msg_type: int,
-        scratch: bytes = b"",
+        payload: Any = None,
     ) -> None:
-        """Schedule a new event at `dest_gid` to arrive `ts_offset` ahead."""
+        """Schedule an event at `dest_gid` to arrive `ts_offset` ahead.
+
+        If `payload` is given (any pickleable object), it is pickled into the
+        event buffer. The class of the payload must be importable on every
+        rank for cross-rank sends. Raises `OverflowError` if the pickled
+        payload exceeds `ross.PAYLOAD_BYTES`."""
         ...
 
 

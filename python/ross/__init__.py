@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Callable, TypeVar
 
-from ._ross import LP, Msg, BitField, Simulator, register_lp_type
+from ._ross import LP, Msg, BitField, Simulator, register_lp_type, PAYLOAD_BYTES
 
 # Internal alias kept for clarity in the decorator.
 _LP = LP
@@ -120,4 +120,5 @@ def lp(name: str) -> Callable[[T], T]:
     return decorate
 
 
-__all__ = ["LP", "Msg", "BitField", "Simulator", "register_lp_type", "lp"]
+__all__ = ["LP", "Msg", "BitField", "Simulator", "register_lp_type", "lp",
+           "PAYLOAD_BYTES"]
